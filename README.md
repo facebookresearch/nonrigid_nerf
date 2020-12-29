@@ -2,7 +2,9 @@
 # Non-Rigid Neural Radiance Fields
 
 This is the official repository for the project "Non-Rigid Neural Radiance Fields:
-Reconstruction and Novel View Synthesis of a Deforming Scene from Monocular Video" (NR-NeRF). We extend NeRF, a state-of-the-art method for photorealistic appearance and geometry reconstruction of a static scene, to deforming/non-rigid scenes. For details, we refer to [the preprint](https://arxiv.org/abs/2012.12247).
+Reconstruction and Novel View Synthesis of a Deforming Scene from Monocular Video" (NR-NeRF). We extend NeRF, a state-of-the-art method for photorealistic appearance and geometry reconstruction of a static scene, to deforming/non-rigid scenes. For details, we refer to [the preprint](https://arxiv.org/abs/2012.12247) and the [project page](https://gvv.mpi-inf.mpg.de/projects/nonrigid_nerf/), which also includes supplemental videos.
+
+![Pipeline figure](pipeline.png)
 
 ## Getting Started
 
@@ -185,6 +187,8 @@ When using this code, please cite our preprint ``Tretschk et al.: Non-Rigid Neur
 `load_llff_data` from `load_llff.py` needs to return a numpy array `images` of shape `N x H x W x 3` with RGB values scaled to lie between 0 and 1, a numpy array `poses` of shape `N x 3 x 5`, where `poses[:,:,:3]` are the camera extrinsic rotations, `poses[:,:,3]` are the camera extrinsic translations in world units, and `poses[:,:,4]` are `height, width, focal length` in pixels at every frame (the same at all `N` frames), `bds` is a numpy array containing the depth values of near and far planes in world units (only the maximum and minimum entries of `bds` matter), `render_poses` is a numpy array of shape `N x 3 x 4` with rotation and translation encoded as for `poses`, and `i_test` is an image index. The first argument specifies the directory from which the images should be loaded, and the second argument specifies a downsampling factor that should be applied to the images. The remaining arguments can be ignored.
 
 `gen_poses` from `llff_preprocessing/pose_utils.py` should compute and store camera parameters of the images given by the first argument such that the format is compatible with `load_llff_data`. The second argument can be ignored.
+
+The camera extrinsic translation is in world space. The translations should be scaled such that the overall scene roughly lies in the unit cube. The camera extrinsic rotation is camera-to-world, `R * c = w`. The camera coordinate system has the x-axis pointing to the right, y up, and z back.
 
 ## License
 

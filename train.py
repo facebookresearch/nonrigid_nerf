@@ -1178,8 +1178,8 @@ def config_parser():
     )
     parser.add_argument(
         "--bd_factor",
-        type=float,
-        default=0.75,
+        type=str,
+        default="0.75",
         help="scales the overall scene, NeRF uses 0.75. is ignored.",
     )
 
