@@ -2,16 +2,16 @@
 # Non-Rigid Neural Radiance Fields
 
 This is the official repository for the project "Non-Rigid Neural Radiance Fields:
-Reconstruction and Novel View Synthesis of a Deforming Scene from Monocular Video" (NR-NeRF). We extend NeRF, a state-of-the-art method for photorealistic appearance and geometry reconstruction of a static scene, to deforming/non-rigid scenes. For details, we refer to [the preprint](https://arxiv.org/abs/2012.12247) and the [project page](https://gvv.mpi-inf.mpg.de/projects/nonrigid_nerf/), which also includes supplemental videos.
+Reconstruction and Novel View Synthesis of a Deforming Scene from Monocular Video" (NR-NeRF). We extend NeRF, a state-of-the-art method for photorealistic appearance and geometry reconstruction of a static scene, to deforming/non-rigid scenes. For details, we refer to [the preprint](https://arxiv.org/abs/2012.12247) and [the project page](https://gvv.mpi-inf.mpg.de/projects/nonrigid_nerf/), which also includes supplemental videos.
 
-![Pipeline figure](pipeline.png)
+![Pipeline figure](misc/pipeline.png)
 
 ## Getting Started
 
 ### Installation
 
 * Clone this repository.
-* Setup the conda environment `nrnerf` (or install the requirements using pip):
+* Setup the conda environment `nrnerf` (or install the requirements using `pip`):
 ```
 conda env create -f environment.yml
 ```
@@ -49,7 +49,8 @@ python train.py --config configs/example_sequence.txt
 ```
 python free_viewpoint_rendering.py --input experiments/experiment_1/ --deformations train --camera_path fixed --fixed_view 10
 ```
-All results will be in the same folder, `experiments/experiment_1/output/train_fixed_10/`.
+All results will be in the same folder, `experiments/experiment_1/output/train_fixed_10/`. The resulting RGB video should look similar to this:
+![Novel view synthesis result on example sequence](misc/example.gif)
 
 ## Convenience Features
 
@@ -192,6 +193,6 @@ The camera extrinsic translation is in world space. The translations should be s
 
 ## License
 
-This code builds on the [PyTorch port by Lin Yen-Chen](https://github.com/yenchenlin/nerf-pytorch) of the [original NeRF code](https://github.com/bmild/nerf). Both are released under an MIT license. Several functions in `run_nerf_helpers.py` are modified versions from the [FFJORD code](https://github.com/rtqichen/ffjord), which is released under an MIT license. We thank all of them for releasing their code.
+This code builds on the [PyTorch port by Yen-Chen Lin](https://github.com/yenchenlin/nerf-pytorch) of the [original NeRF code](https://github.com/bmild/nerf). Both are released under an MIT license. Several functions in `run_nerf_helpers.py` are modified versions from the [FFJORD code](https://github.com/rtqichen/ffjord), which is released under an MIT license. We thank all of them for releasing their code.
 
 We release this code under an MIT license as well. You can find all licenses in the file `LICENSE`.
