@@ -49,7 +49,9 @@ python train.py --config configs/example_sequence.txt
 ```
 python free_viewpoint_rendering.py --input experiments/experiment_1/ --deformations train --camera_path fixed --fixed_view 10
 ```
-All results will be in the same folder, `experiments/experiment_1/output/train_fixed_10/`. The resulting RGB video should look similar to this:
+All results will be in the same folder, `experiments/experiment_1/output/train_fixed_10/`.
+
+Overall, the input video (left) is re-rendered into a fixed novel view (right):
 
 ![Novel view synthesis result on example sequence](misc/example.gif)
 
