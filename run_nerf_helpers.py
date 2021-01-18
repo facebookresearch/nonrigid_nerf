@@ -71,7 +71,7 @@ def compute_divergence_loss(
 def divergence_exact(input_points, offsets_of_inputs):
     # requires three backward passes instead one like divergence_approx
     jac = _get_minibatch_jacobian(offsets_of_inputs, input_points)
-    diagonal = jac.view(jac.shape[0], -1)[:, :: jac.shape[1]]
+    diagonal = jac.view(jac.shape[0], -1)[:, :: (jac.shape[1]+1)]
     return torch.sum(diagonal, 1)
 
 
