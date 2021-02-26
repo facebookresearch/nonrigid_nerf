@@ -85,7 +85,7 @@ As this is a research project, it is not sufficiently robust to work on arbitrar
 
 ### Preprocess
 
-** Determining Camera Parameters **
+**Determining Camera Parameters**
 
 Before we can train a network on a newly recorded sequence, we need to estimate its camera parameters (extrinsics and intrinsics).
 
@@ -95,7 +95,7 @@ python preprocess.py --input PARENT_FOLDER
 ```
 The `--output OUTPUT_FOLDER` option allows to set a custom output folder, otherwise `PARENT_FOLDER` is used by default.
 
-** (Optional) Lens Distortion Estimation and Image Undistortion **
+**(Optional) Lens Distortion Estimation and Image Undistortion**
 
 While not necessary for decent results with most camera lenses, the preprocessing code allows to estimate lens distortions from a checkerboard/chessboard sequence and to then use the estimated distortion parameters to undistort input sequences recorded with the same camera.
 
@@ -107,7 +107,7 @@ The calibration code uses [OpenCV](https://docs.opencv.org/4.4.0/dc/dbb/tutorial
 
 Then, in order to undistort an input sequence using the computed parameters, simply add `--undistort_with_calibration_file PATH_TO_LENS_DISTORTION_JSON` when preprocessing the sequence using `preprocess.py` as described under *Determining Camera Parameters*.
 
-** (Optional) Video Input **
+**(Optional) Video Input**
 
 In addition to image files, the preprocessing code in `preprocess.py` also supports video input. Simply set `--input` to the video file.
 
@@ -140,7 +140,7 @@ If a previous version of the experiment exists, `train.py` will automatically co
 
 The `--time_conditioned_baseline` flag will turn on the naive NR-NeRF baseline described in the paper.
 
-** (Optional) Multi-View Data and Per-Camera Intrinsics **
+**(Optional) Multi-View Data and Per-Camera Intrinsics**
 
 NR-NeRF supports multi-view setups. A deformation latent code is associated with each time step, and multiple images can be associated with each time step.
 
@@ -174,7 +174,7 @@ To load multi-view data, please replace the call to `load_llff_data` in `train.p
 
 Furthermore, using multi-view data requires specifying per-camera intrinsics. In the implementation, the file `PARENT_FOLDER/calibration.json` contains both intrinsics and extrinsics. Note that this `calibration.json` file is not necessary for monocular setups. If you want to use per-image intrinsics for a monocular setup, treat it as a multi-view setup where each image has its own unique time step.
 
-Similar to before, `calibration.json` starts out as a Python dict `calibration`. It contains entries `calibration[min_bound]` and `calibration[max_bound]` that each are a float. `min_bound` is the distance from a camera to the near plance, and `max_bound` is the distance to the far plane, both in world units. In addition, for each camera, `calibration` contains an entry `calibration[camera_string] = camera_calibration`, where `camera_string` has to be consistent with the `camera_string` from `image_to_camera_id_and_timestep`. `camera_calibration` is again a Python dict that contains an entry `translation` (list of three floats), `rotation` (list of three lists of three floats, gotten via `rotation.tolist()` from a numpy array), `center_x` and `center_y` (each a float, camera center in pixel units), `focal_x` and `focal_y` (each a float, focal length in pixel units), and `height` and `width` (each an integer, in pixel units). For translation and rotation, see at the end of this README for how they are defined.
+Similar to before, `calibration.json` starts out as a Python dict `calibration`. It contains entries `calibration["min_bound"] = min_bound` and `calibration["max_bound"] = max_bound` that each are a float. `min_bound` is the distance from a camera to the near plance, and `max_bound` is the distance to the far plane, both in world units. In addition, for each camera, `calibration` contains an entry `calibration[camera_string] = camera_calibration`, where `camera_string` has to be consistent with the `camera_string` from `image_to_camera_id_and_timestep`. `camera_calibration` is again a Python dict that contains an entry `translation` (list of three floats), `rotation` (list of three lists of three floats, gotten via `rotation.tolist()` from a numpy array), `center_x` and `center_y` (each a float, camera center in pixel units), `focal_x` and `focal_y` (each a float, focal length in pixel units), and `height` and `width` (each an integer, in pixel units). For translation and rotation, see at the end of this README for how they are defined.
 
 Example file content with one camera named `0`:
 ```
@@ -231,7 +231,7 @@ python free_viewpoint_rendering.py --input INPUT --deformations train --camera_p
 
 The `fixed` camera view uses the first input view by default. This can be set to another index (e.g. 5) with `--fixed_view 5`.
 
-** Evaluation **
+**Evaluation**
 
 When using `fixed`, the code will compute the standard deviation across images to visualize the background stability and store the result in `standard_deviation.png`.
 
@@ -240,7 +240,7 @@ When using `input_recontruction`, the code will automatically evaluate the resul
 git clone https://github.com/richzhang/PerceptualSimilarity
 ```
 
-** Simple Scene Editing **
+**Simple Scene Editing**
 
 The `--motion_factor 1.2` option exaggerates the deformation by a factor of 1.2. Factors below 1 dampen the motion.
 
@@ -252,11 +252,11 @@ Furthermore, the forced background stabilization described in the preprint can b
 
 The canonical model (without any ray bending applied) can be rendered by setting the `--render_canonical` flag.
 
-** (Optional) Video Generation **
+**(Optional) Video Generation**
 
 For automatic video generation, please install `ffmpeg`. The framerate of the generated output videos can be set with `--output_video_fps 5`.
 
-** (Optional) Adaptive Spiral Camera Path **
+**(Optional) Adaptive Spiral Camera Path**
 
 It is possible to use a spiral camera path that adapts to the length of the video. If you do not want to implement such a path yourself, you can copy and modify the `else` branch in `load_llff_data` of [LLFF's](https://github.com/Fyusion/LLFF) `load_llff.py`. You can find a recommended wrapper in `free_viewpoint_rendering`: `_spiral_poses`. Set `N_views` to `num_poses`. We recommend multiplying `rads` in `render_path_spiral` right before the `for` loop by `0.5`.
 
