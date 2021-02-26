@@ -16,6 +16,7 @@ from tqdm import tqdm, trange
 import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
+#from load_llff import load_llff_data_multi_view
 from load_llff import load_llff_data
 
 
@@ -150,10 +151,6 @@ class training_wrapper_class(torch.nn.Module):
 
     def forward(
         self,
-        H,
-        W,
-        focal,
-        ray_params,
         args,
         rays_o,
         rays_d,
@@ -198,10 +195,6 @@ class training_wrapper_class(torch.nn.Module):
             detailed_output = False
 
         rgb, disp, acc, extras = render(
-            H,
-            W,
-            focal,
-            ray_params,
             rays_o,
             rays_d,
             chunk=args.chunk,
@@ -212,7 +205,7 @@ class training_wrapper_class(torch.nn.Module):
             **render_kwargs_train,
         )  # rays need to be split for parallel call
 
-        # consider rgb and ray validity in loss function
+        # data loss
         img_loss = img2mse(rgb, target_s, N_rays)
         trans = extras["raw"][..., -1]
         loss = img_loss  # shape: N_rays
@@ -227,10 +220,17 @@ class training_wrapper_class(torch.nn.Module):
         if self.ray_bender is not None and args.offsets_loss_weight > 0.0:
             offsets = extras["unmasked_offsets"].view(-1, 3)
             weights = extras["visibility_weights"].detach().view(-1)
-            # reshape to N_rays x samples and take mean across samples to get shape (N_rays,)
+            # reshape to N_rays x samples and take mean across samples to get shape (N_rays,)         
             offsets_loss = torch.mean(
-                (weights * torch.norm(offsets, dim=-1)).view(N_rays, -1), dim=-1
-            )  # shape: N_rays. L1 loss. "offsets" includes only coarse samples
+                (weights * torch.pow(
+                    torch.norm(extras["unmasked_offsets"].view(-1, 3), dim=-1), 
+                    2. - extras["rigidity_mask"].view(-1))
+                ).view(N_rays,-1), 
+                dim=-1
+            ) # shape: N_rays. L1 loss. "offsets" includes only coarse samples            
+            #offsets_loss = torch.mean(
+            #    (weights * torch.norm(offsets, dim=-1)).view(N_rays, -1), dim=-1
+            #)  # shape: N_rays. L1 loss. "offsets" includes only coarse samples
             offsets_loss += args.rigidity_loss_weight * torch.mean(
                 (weights * extras["rigidity_mask"].view(-1)).view(N_rays, -1), dim=-1
             )
@@ -324,10 +324,6 @@ def get_parallelized_render_function(coarse_model, fine_model=None, ray_bender=N
 
 
 def render(
-    H,
-    W,
-    focal,
-    ray_params,
     rays_o,
     rays_d,
     chunk=1024 * 32,  # c2w=None,
@@ -377,6 +373,7 @@ def render(
             raise RuntimeError(
                 "need to pull this call to get_rays out to render_path() for gpu parallelization to work"
             )
+            # remove H, W, focal. ray_params is intrinsics
             rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam, ray_params)
             rays_o = rays_o.reshape(-1, 3)
             rays_d = rays_d.reshape(-1, 3)
@@ -386,6 +383,7 @@ def render(
     sh = rays_d.shape  # [..., 3]
     if ndc:
         # for forward facing scenes
+        raise RuntimeError("not implemented. change H, W, focal to use ray_params instead")
         rays_o, rays_d = ndc_rays(H, W, focal, 1.0, rays_o, rays_d)
 
     # Create ray batch
@@ -420,9 +418,8 @@ def render(
 
 def render_path(
     render_poses,
-    hwf,
+    intrinsics,
     chunk,
-    ray_params,
     render_kwargs,
     ray_bending_latents,
     gt_imgs=None,
@@ -432,37 +429,40 @@ def render_path(
     parallelized_render_function=None,
 ):
 
-    H, W, focal = hwf
+    # intrinsics are stacked similar to render_poses
 
-    if render_factor != 0:
+    if render_factor!=0:
         # Render downsampled for speed
-        H = H // render_factor
-        W = W // render_factor
-        if type(focal) == list:
-            focal = [focal_i / render_factor for focal_i in focal]
-        else:
-            focal = focal / render_factor
+        new_intrinsics = []
+        for intrin in intrinsics:
+            new_intrin = intrin.copy()
+            new_intrin["height"] = new_intrin["height"] // render_factor
+            new_intrin["width"] = new_intrin["width"] // render_factor
+            new_intrin["focal_x"] = new_intrin["focal_x"] / render_factor
+            new_intrin["focal_y"] = new_intrin["focal_y"] / render_factor
+            new_intrin["center_x"] = new_intrin["center_x"] / render_factor
+            new_intrin["center_y"] = new_intrin["center_y"] / render_factor
+            new_intrinsics.append(new_intrin)
+        intrinsics = new_intrinsics
 
     rgbs = []
     disps = []
     all_details_and_rest = []
 
     t = time.time()
-    for i, c2w in enumerate(tqdm(render_poses)):
+    for i, (c2w, intrin) in enumerate(tqdm(zip(render_poses, intrinsics))):
         print(i, time.time() - t)
         t = time.time()
         single_latent_code = ray_bending_latents[i]
 
         this_c2w = c2w[:3, :4]
         device = this_c2w.get_device()
-        rays_o, rays_d = get_rays(H, W, focal, this_c2w, ray_params)
+        rays_o, rays_d = get_rays(this_c2w, intrin)
         height, width = rays_o.shape[0], rays_o.shape[1]
         rays_o = rays_o.reshape(-1, 3)
         rays_d = rays_d.reshape(-1, 3)
         additional_pixel_information = {
-            "ray_bending_latents": single_latent_code.reshape(
-                1, ray_params["ray_bending_latent_size"]
-            ).expand(H * W, ray_params["ray_bending_latent_size"]),
+            "ray_bending_latents": single_latent_code.reshape(1,intrin["ray_bending_latent_size"]).expand(height*width, intrin["ray_bending_latent_size"]),
         }
 
         render_function = (
@@ -471,10 +471,6 @@ def render_path(
             else parallelized_render_function
         )
         rgb, disp, acc, details_and_rest = render_function(
-            H,
-            W,
-            focal,
-            ray_params,
             rays_o,
             rays_d,
             chunk=chunk,
@@ -574,6 +570,12 @@ def create_nerf(args, autodecoder_variables=None, ignore_optimizer=False):
         grad_vars += list(ray_bender.parameters())
     else:
         ray_bender = None
+        
+    if args.time_conditioned_baseline:
+        if args.ray_bending == "simple_neural":
+            raise RuntimeError("Naive Baseline requires to turn off ray bending")
+        if args.offsets_loss_weight > 0. or args.divergence_loss_weight > 0. or args.rigidity_loss_weight > 0.:
+            raise RuntimeError("Naive Baseline requires to turn off regularization losses since they only work with ray bending")
 
     input_ch_views = 0
     embeddirs_fn = None
@@ -603,6 +605,7 @@ def create_nerf(args, autodecoder_variables=None, ignore_optimizer=False):
         embeddirs_fn=embeddirs_fn,
         num_ray_samples=args.N_samples,
         approx_nonrigid_viewdirs=args.approx_nonrigid_viewdirs,
+        time_conditioned_baseline=args.time_conditioned_baseline,
     ).cuda()
     grad_vars += list(
         model.parameters()
@@ -623,6 +626,7 @@ def create_nerf(args, autodecoder_variables=None, ignore_optimizer=False):
             embeddirs_fn=embeddirs_fn,
             num_ray_samples=args.N_samples + args.N_importance,
             approx_nonrigid_viewdirs=args.approx_nonrigid_viewdirs,
+            time_conditioned_baseline=args.time_conditioned_baseline,
         ).cuda()
         grad_vars += list(model_fine.parameters())
 
@@ -968,9 +972,10 @@ def render_rays(
             ret[key] = details[key]
 
     global DEBUG
-    for k in ret:
-        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
-            print(f"! [Numerical Error] {k} contains nan or inf.", flush=True)
+    if DEBUG:
+        for k in ret:
+            if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()):
+                print(f"! [Numerical Error] {k} contains nan or inf.", flush=True)
 
     return ret
 
@@ -1061,6 +1066,11 @@ def config_parser():
         "--approx_nonrigid_viewdirs",
         action="store_true",
         help="approximate nonrigid view directions of the bent ray instead of exact",
+    )
+    parser.add_argument(
+        "--time_conditioned_baseline",
+        action="store_true",
+        help="use the naive NR-NeRF baseline described in the paper",
     )
 
     parser.add_argument(
@@ -1209,10 +1219,19 @@ def config_parser():
     return parser
 
 
-def _get_multi_view_helper_mappings(num_images):
+def _get_multi_view_helper_mappings(num_images, datadir):
     imgnames = range(num_images)
     extras = {}
-    multi_view_mapping = dict([(name, [i, i]) for i, name in enumerate(imgnames)])
+    
+    multi_view_mapping = os.path.join(datadir, "image_to_camera_id_and_timestep.json")
+    if os.path.exists(multi_view_mapping):
+        extras["is_multiview"] = True
+        import json
+        with open(multi_view_mapping, "r") as multi_view_mapping:
+            multi_view_mapping = json.load(multi_view_mapping)
+    else:
+        extras["is_multiview"] = False
+        multi_view_mapping = dict([ (name, [i, i]) for i, name in enumerate(imgnames) ])
 
     sorted_multi_view_mapping = {}
     raw_multi_view_list = []
@@ -1246,6 +1265,61 @@ def _get_multi_view_helper_mappings(num_images):
     ]
 
     return extras
+    
+  
+def get_full_resolution_intrinsics(args, dataset_extras):
+
+    intrinsics = {} # intrinsics[raw_view] = {"center_x": ..., "center_y": ..., "focal_x": ..., "focaly_y": ..., "height": ..., "width": ...}
+
+    if dataset_extras["is_multiview"]: # multi-view
+        image_folder = "images"
+        import json
+        with open(os.path.join(args.datadir, "calibration_averaged_camera_view.json"), "r") as json_file:
+            calibration = json.load(json_file)
+
+        for raw_view in calibration.keys():
+            if raw_view in ["focal", "height", "width", "min_bound", "max_bound"]:
+                continue
+
+            camera = {
+                "height": calibration[raw_view]["height"],
+                "width": calibration[raw_view]["width"],
+                "focal_x": calibration[raw_view]["focal_x"],
+                "focal_y": calibration[raw_view]["focal_y"],
+                "center_x": calibration[raw_view]["center_x"],
+                "center_y": calibration[raw_view]["center_y"],
+                }
+
+            intrinsics[raw_view] = camera
+
+    else: # monocular
+        def _get_info(image_folder):
+            imgdir = os.path.join(args.datadir, image_folder)
+            imgnames = [f for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+            imgfiles = [os.path.join(imgdir, f) for f in imgnames]
+            def imread(f):
+                return imageio.imread(f, ignoregamma=True) if f[-4:] == ".png" else imageio.imread(f)
+            height, width, _ = imread(imgfiles[0]).shape
+            return imgfiles, height, width
+
+        image_folder = "images"
+        imgfiles, height, width = _get_info(image_folder)
+        center_x = width / 2
+        center_y = height / 2
+        focal_x = None
+        focal_y = None
+
+        # duplicate to all images
+        one_camera = {"height": height, "width": width, "focal_x": focal_x, "focal_y": focal_y, "center_x": center_x, "center_y": center_y}
+        raw_views = np.arange(len(imgfiles))
+        for raw_view in raw_views:
+            intrinsics[raw_view] = one_camera.copy()
+
+    # take care of common values
+    for camera in intrinsics.values():
+        camera["ray_bending_latent_size"] = args.ray_bending_latent_size
+
+    return intrinsics, image_folder
 
 
 def main_function(args):
@@ -1257,18 +1331,10 @@ def main_function(args):
     if args.seed >= 0:
         np.random.seed(args.seed)
 
-    # camera parameters
-    ray_params = {"ray_bending_latent_size": args.ray_bending_latent_size}
-    ray_params[
-        "focal_x"
-    ] = None  # focal_x will be equal to focal_y later on. ray_params allows to set custom values.
-    ray_params["focal_y"] = None
-    ray_params["center_x"] = None
-    ray_params["center_y"] = None
-
     # Load data
 
     if args.dataset_type == "llff":
+        #images, poses, bds, render_poses, i_test = load_llff_data_multi_view(
         images, poses, bds, render_poses, i_test = load_llff_data(
             args.datadir,
             factor=args.factor,
@@ -1276,20 +1342,34 @@ def main_function(args):
             bd_factor=args.bd_factor,
             spherify=args.spherify,
         )
-        dataset_extras = _get_multi_view_helper_mappings(images.shape[0])
-
-        if ray_params["focal_x"] is not None:
-            ray_params["focal_x"] /= args.factor
-        if ray_params["focal_y"] is not None:
-            ray_params["focal_y"] /= args.factor
-        if ray_params["center_x"] is not None:
-            ray_params["center_x"] /= args.factor
-        if ray_params["center_y"] is not None:
-            ray_params["center_y"] /= args.factor
-
+        dataset_extras = _get_multi_view_helper_mappings(images.shape[0], args.datadir)
+        intrinsics, image_folder = get_full_resolution_intrinsics(args, dataset_extras)
+        
         hwf = poses[0, :3, -1]
         poses = poses[:, :3, :4]
         print("Loaded llff", images.shape, render_poses.shape, hwf, args.datadir)
+
+        # check if height, width, focal_x and focal_y are None. if so, use hwf to set them in intrinsics
+        # do not use this for loop and the next in smallscripts. instead rely on the stored/saved version of "intrinsics"
+        for camera in intrinsics.values(): # downscale according to args.factor
+            camera["height"] = images.shape[1]
+            camera["width"] = images.shape[2]
+            if camera["focal_x"] is None:
+                camera["focal_x"] = hwf[2]
+            else:
+                camera["focal_x"] /= args.factor
+            if camera["focal_y"] is None:
+                camera["focal_y"] = hwf[2]
+            else:
+                camera["focal_y"] /= args.factor
+            camera["center_x"] /= args.factor
+            camera["center_y"] /= args.factor
+        # modify "intrinsics" mapping to use viewid instead of raw_view
+        for raw_view in list(intrinsics.keys()):
+            viewid = dataset_extras["rawview_to_viewid"][raw_view]
+            new_entry = intrinsics[raw_view]
+            del intrinsics[raw_view]
+            intrinsics[viewid] = new_entry
 
         # take out chunks (args parameters: train & test block lengths)
         i_test = []  # [i_test]
@@ -1347,13 +1427,6 @@ def main_function(args):
         print("Unknown dataset type", args.dataset_type, "exiting")
         return
 
-    # Cast intrinsics to right types
-    H, W, focal = hwf
-    H, W = int(H), int(W)
-    if ray_params["focal_x"] is not None:
-        focal = [ray_params["focal_x"], ray_params["focal_y"]]
-    hwf = [H, W, focal]
-
     if args.render_test:
         render_poses = np.array(poses[i_test])
 
@@ -1394,7 +1467,7 @@ def main_function(args):
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
 
-    scripts_dict = {"hwf": hwf, "near": near, "far": far}
+    scripts_dict = {"near": near, "far": far, "image_folder": image_folder}
 
     coarse_model = render_kwargs_train["network_fn"]
     fine_model = render_kwargs_train["network_fine"]
@@ -1410,7 +1483,7 @@ def main_function(args):
     )  # only used by render_path() at test time, not for training/optimization
 
     min_point, max_point = determine_nerf_volume_extent(
-        parallel_render, poses, H, W, focal, ray_params, render_kwargs_train, args
+        parallel_render, poses, [ intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in range(poses.shape[0]) ], render_kwargs_train, args
     )
     scripts_dict["min_nerf_volume_point"] = min_point.detach().cpu().numpy().tolist()
     scripts_dict["max_nerf_volume_point"] = max_point.detach().cpu().numpy().tolist()
@@ -1422,14 +1495,12 @@ def main_function(args):
     N_rand = args.N_rand
     # For random ray batching
     print("get rays")
-    rays = np.stack(
-        [get_rays_np(H, W, focal, p, ray_params) for p in poses[:, :3, :4]], 0
-    )  # [N, ro+rd, H, W, 3]
+    rays = np.stack([get_rays_np(p, intrinsics[dataset_extras["imageid_to_viewid"][imageid]]) for imageid, p in enumerate(poses[:,:3,:4])], 0) # [N, ro+rd, H, W, 3]
     print("done, concats")
 
     # attach index information (index among all images in dataset, x and y coordinate)
     image_indices, y_coordinates, x_coordinates = np.meshgrid(
-        np.arange(images.shape[0]), np.arange(H), np.arange(W), indexing="ij"
+        np.arange(images.shape[0]), np.arange(intrinsics[0]["height"]), np.arange(intrinsics[0]["width"]), indexing="ij"
     )  # keep consistent with code in get_rays and get_rays_np. (0,0,0) is coordinate of the top-left corner of the first image, i.e. of [0,0,0]. each array has shape images x height x width
     additional_indices = np.stack(
         [image_indices, x_coordinates, y_coordinates], axis=-1
@@ -1473,8 +1544,8 @@ def main_function(args):
         # Random over all images
         # use np random to samples N_rand random image IDs, x and y values
         image_indices = np.random.randint(images.shape[0], size=args.N_rand)
-        x_coordinates = np.random.randint(W, size=args.N_rand)
-        y_coordinates = np.random.randint(H, size=args.N_rand)
+        x_coordinates = np.random.randint(intrinsics[0]["width"], size=args.N_rand)
+        y_coordinates = np.random.randint(intrinsics[0]["height"], size=args.N_rand)
 
         # index rays_rgb with those values
         batch = rays_rgb[
@@ -1493,10 +1564,6 @@ def main_function(args):
         batch_rays, target_s = batch[:2], batch[2]
 
         losses = parallel_training(
-            H,
-            W,
-            focal,
-            ray_params,
             args,
             batch_rays[0],
             batch_rays[1],
@@ -1624,7 +1691,7 @@ def main_function(args):
                     else render_kwargs_train["ray_bender"].state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "ray_bending_latent_codes": all_latents,  # shape: frames x latent_size
-                    "ray_params": ray_params,
+                    "intrinsics": intrinsics,
                     "scripts_dict": scripts_dict,
                     "dataset_extras": dataset_extras,
                 },
@@ -1640,7 +1707,7 @@ def main_function(args):
         if i % args.i_video == 0 and i > 0:
             # Turn on testing mode
             print("rendering test set...", flush=True)
-            if len(render_poses) > 0 and len(i_test) > 0:
+            if len(render_poses) > 0 and len(i_test) > 0 and not dataset_extras["is_multiview"]:
                 with torch.no_grad():
                     if args.render_test:
                         rendering_latents = ray_bending_latents = [
@@ -1658,9 +1725,8 @@ def main_function(args):
                         ]
                     rgbs, disps = render_path(
                         render_poses,
-                        hwf,
+                        [intrinsics[0] for _ in range(len(render_poses))],
                         args.chunk,
-                        ray_params,
                         render_kwargs_test,
                         ray_bending_latents=rendering_latents,
                         parallelized_render_function=parallel_render,
@@ -1719,9 +1785,8 @@ def main_function(args):
                 with torch.no_grad():
                     rgbs, disps = render_path(
                         poses[i_train],
-                        hwf,
+                        [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_train],
                         args.chunk,
-                        ray_params,
                         render_kwargs_test,
                         ray_bending_latents=[
                             ray_bending_latents_list[
@@ -1796,9 +1861,8 @@ def main_function(args):
             with torch.no_grad():
                 render_path(
                     poses[i_train_sub],
-                    hwf,
+                    [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_train_sub],
                     args.chunk,
-                    ray_params,
                     render_kwargs_test,
                     gt_imgs=images[i_train_sub],
                     savedir=trainsubsavedir,
@@ -1820,9 +1884,8 @@ def main_function(args):
                 with torch.no_grad():
                     render_path(
                         poses[i_test],
-                        hwf,
+                        [intrinsics[dataset_extras["imageid_to_viewid"][imageid]] for imageid in i_test],
                         args.chunk,
-                        ray_params,
                         render_kwargs_test,
                         gt_imgs=images[i_test],
                         savedir=testsavedir,

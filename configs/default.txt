@@ -9,13 +9,14 @@ debug = False
 ray_bending = simple_neural # None, simple_neural
 ray_bending_latent_size = 32
 
-factor = 4
+factor = 1
 
-offsets_loss_weight = 0.2
-divergence_loss_weight = 3
-rigidity_loss_weight = 1
+offsets_loss_weight = 600.
+divergence_loss_weight = 3.
+rigidity_loss_weight = 0.001
 use_viewdirs = False
 approx_nonrigid_viewdirs = True
+time_conditioned_baseline = False
 
 lrate_decay = 250000
 N_iters = 200000

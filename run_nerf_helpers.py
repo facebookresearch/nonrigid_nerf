@@ -59,6 +59,8 @@ def compute_divergence_loss(
     )
 
     divergence_loss = torch.abs(divergence_loss)
+    divergence_loss = divergence_loss ** 2
+    
     if weights is not None:
         if not backprop_into_weights:
             weights = weights.detach()
@@ -182,6 +184,7 @@ class NeRF(nn.Module):
         embeddirs_fn=None,
         num_ray_samples=None,
         approx_nonrigid_viewdirs=True,
+        time_conditioned_baseline=False,
     ):
         """"""
         super(NeRF, self).__init__()
@@ -196,6 +199,14 @@ class NeRF(nn.Module):
         self.approx_nonrigid_viewdirs = approx_nonrigid_viewdirs  # approx uses finite differences, while exact uses three additional passes through ray bending in the forward pass
         self.embeddirs_fn = embeddirs_fn
         self.num_ray_samples = num_ray_samples  # netchunk needs to be divisible by both coarse and fine num_ray_samples
+        
+        # simple scene editing. set to None during training
+        self.test_time_nonrigid_object_removal_threshold = None
+        
+        # naive NR-NeRF baseline
+        self.time_conditioned_baseline = time_conditioned_baseline
+        if self.time_conditioned_baseline:
+            input_ch += ray_bending_latent_size
 
         # ray bending
         self.ray_bending_latent_size = ray_bending_latent_size
@@ -259,11 +270,16 @@ class NeRF(nn.Module):
             details["input_pts"] = input_pts[:, :3].clone().detach()
 
         h = input_pts
+        if self.time_conditioned_baseline:
+            h = torch.cat([h, input_latents], -1)
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = F.relu(h)
             if i in self.skips:
-                h = torch.cat([input_pts, h], -1)
+                if self.time_conditioned_baseline:
+                    h = torch.cat([input_pts, input_latents, h], -1)
+                else:
+                    h = torch.cat([input_pts, h], -1)
 
         if self.use_viewdirs:
             alpha = self.alpha_linear(h)
@@ -290,6 +306,9 @@ class NeRF(nn.Module):
             outputs = self.output_linear(h)
 
         if detailed_output:
+            if self.test_time_nonrigid_object_removal_threshold is not None:
+                outputs[ details["rigidity_mask"].flatten() >= self.test_time_nonrigid_object_removal_threshold , 3] *= 0. # make nonrigid objects invisible
+                #outputs[ details["rigidity_mask"].flatten() <= self.test_time_nonrigid_object_removal_threshold , 3] *= 0. # make rigid objects invisible
             return outputs, details
         else:
             return outputs
@@ -378,7 +397,9 @@ class ray_bending(nn.Module):
         self.ray_bending_mode = ray_bending_mode
         self.embed_fn = embed_fn
         self.use_rigidity_network = True
+        # simple scene editing. set to None during training.
         self.rigidity_test_time_cutoff = None
+        self.test_time_scaling = None
 
         if self.ray_bending_mode == "simple_neural":
             self.activation_function = F.relu  # F.relu, torch.sin
@@ -544,11 +565,15 @@ class ray_bending(nn.Module):
 
         if self.use_rigidity_network:
             masked_offsets = rigidity_mask * unmasked_offsets
+            if self.test_time_scaling is not None:
+                masked_offsets *= self.test_time_scaling
             new_points = raw_input_pts + masked_offsets  # skip connection
             if details is not None:
                 details["rigidity_mask"] = rigidity_mask
                 details["masked_offsets"] = masked_offsets
         else:
+            if self.test_time_scaling is not None:
+                unmasked_offsets *= self.test_time_scaling
             new_points = raw_input_pts + unmasked_offsets  # skip connection
 
         if special_loss_return:  # used for compute_divergence_loss()
@@ -560,122 +585,65 @@ class ray_bending(nn.Module):
 
 
 # Ray helpers
-def get_rays(H, W, focal, c2w, ray_params):
+def get_rays(c2w, intrin):
+    H = intrin["height"]
+    W = intrin["width"]
     device = c2w.get_device()
-    i, j = torch.meshgrid(
-        torch.linspace(0, W - 1, W, device=device),
-        torch.linspace(0, H - 1, H, device=device),
-    )  # pytorch's meshgrid has indexing='ij' # keep consistent with meshgrid train.py
+    i, j = torch.meshgrid(torch.linspace(0, W-1, W, device=device), torch.linspace(0, H-1, H, device=device))  # pytorch's meshgrid has indexing='ij' # keep consistent with meshgrid run_nerf.py
     i = i.t()
     j = j.t()
-    if type(focal) == list:
-        focal_x, focal_y = focal
-        if focal_x != ray_params["focal_x"] or focal_y != ray_params["focal_y"]:
-            raise RuntimeError(
-                "inconsistent focal lengths: "
-                + str(focal_x)
-                + " "
-                + str(ray_params["focal_x"])
-                + " "
-                + str(focal_y)
-                + " "
-                + str(ray_params["focal_y"])
-            )
-    else:
-        focal_x = focal
-        focal_y = focal
-    if ray_params["center_x"] is None:
-        center_x = W * 0.5
-        center_y = H * 0.5
-    else:
-        center_x = ray_params["center_x"]
-        center_y = ray_params["center_y"]
-    dirs = torch.stack(
-        [
-            (i - center_x) / focal_x,
-            -(j - center_y) / focal_y,
-            -torch.ones_like(i, device=device),
-        ],
-        -1,
-    )  # axes orientations (?): x right, y upwards, z negative
+    focal_x = intrin["focal_x"]
+    focal_y = intrin["focal_y"]
+    center_x = intrin["center_x"]
+    center_y = intrin["center_y"]
+    dirs = torch.stack([(i-center_x)/focal_x, -(j-center_y)/focal_y, -torch.ones_like(i, device=device)], -1) # axes orientations (?): x right, y upwards, z negative
+    #dirs = torch.stack([(i-W*.5)/focal_x, -(j-H*.5)/focal_y, -torch.ones_like(i)], -1) # axes orientations (?): x right, y upwards, z negative
     # Rotate ray directions from camera frame to the world frame
-    rays_d = torch.sum(
-        dirs[..., np.newaxis, :] * c2w[:3, :3], -1
-    )  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    rays_d = torch.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = c2w[:3, -1].expand(rays_d.shape)
+    rays_o = c2w[:3,-1].expand(rays_d.shape)
     return rays_o, rays_d
 
 
-def get_rays_np(H, W, focal, c2w, ray_params):
-    i, j = np.meshgrid(
-        np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing="xy"
-    )  # keep consistent with meshgrid train.py
-    if type(focal) == list:
-        focal_x, focal_y = focal
-        if focal_x != ray_params["focal_x"] or focal_y != ray_params["focal_y"]:
-            raise RuntimeError(
-                "inconsistent focal lengths: "
-                + str(focal_x)
-                + " "
-                + str(ray_params["focal_x"])
-                + " "
-                + str(focal_y)
-                + " "
-                + str(ray_params["focal_y"])
-            )
-    else:
-        focal_x = focal
-        focal_y = focal
-    if ray_params["center_x"] is None:
-        center_x = W * 0.5
-        center_y = H * 0.5
-    else:
-        center_x = ray_params["center_x"]
-        center_y = ray_params["center_y"]
-    dirs = np.stack(
-        [(i - center_x) / focal_x, -(j - center_y) / focal_y, -np.ones_like(i)], -1
-    )
+def get_rays_np(c2w, intrin):
+    H = intrin["height"]
+    W = intrin["width"]
+    i, j = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32), indexing='xy') # keep consistent with meshgrid run_nerf.py
+    focal_x = intrin["focal_x"]
+    focal_y = intrin["focal_y"]
+    center_x = intrin["center_x"]
+    center_y = intrin["center_y"]
+    dirs = np.stack([(i-center_x)/focal_x, -(j-center_y)/focal_y, -np.ones_like(i)], -1)
+    #dirs = np.stack([(i-W*.5)/focal_x, -(j-H*.5)/focal_y, -np.ones_like(i)], -1)
     # Rotate ray directions from camera frame to the world frame
-    rays_d = np.sum(
-        dirs[..., np.newaxis, :] * c2w[:3, :3], -1
-    )  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3,:3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
-    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
+    rays_o = np.broadcast_to(c2w[:3,-1], np.shape(rays_d))
     return rays_o, rays_d
 
 
-def ndc_rays(H, W, focal, near, rays_o, rays_d):
-    if type(focal) == list:
-        focal_x, focal_y = focal
-    else:
-        focal_x = focal
-        focal_y = focal
+def ndc_rays(intrin, near, rays_o, rays_d):
+    H = intrin["height"]
+    W = intrin["width"]
+    focal_x = intrin["focal_x"]
+    focal_y = intrin["focal_y"]
 
     # Shift ray origins to near plane
-    t = -(near + rays_o[..., 2]) / rays_d[..., 2]
-    rays_o = rays_o + t[..., None] * rays_d
-
+    t = -(near + rays_o[...,2]) / rays_d[...,2]
+    rays_o = rays_o + t[...,None] * rays_d
+    
     # Projection
-    o0 = -1.0 / (W / (2.0 * focal_x)) * rays_o[..., 0] / rays_o[..., 2]
-    o1 = -1.0 / (H / (2.0 * focal_y)) * rays_o[..., 1] / rays_o[..., 2]
-    o2 = 1.0 + 2.0 * near / rays_o[..., 2]
+    o0 = -1./(W/(2.*focal_x)) * rays_o[...,0] / rays_o[...,2]
+    o1 = -1./(H/(2.*focal_y)) * rays_o[...,1] / rays_o[...,2]
+    o2 = 1. + 2. * near / rays_o[...,2]
 
-    d0 = (
-        -1.0
-        / (W / (2.0 * focal_x))
-        * (rays_d[..., 0] / rays_d[..., 2] - rays_o[..., 0] / rays_o[..., 2])
-    )
-    d1 = (
-        -1.0
-        / (H / (2.0 * focal_y))
-        * (rays_d[..., 1] / rays_d[..., 2] - rays_o[..., 1] / rays_o[..., 2])
-    )
-    d2 = -2.0 * near / rays_o[..., 2]
-
-    rays_o = torch.stack([o0, o1, o2], -1)
-    rays_d = torch.stack([d0, d1, d2], -1)
-
+    d0 = -1./(W/(2.*focal_x)) * (rays_d[...,0]/rays_d[...,2] - rays_o[...,0]/rays_o[...,2])
+    d1 = -1./(H/(2.*focal_y)) * (rays_d[...,1]/rays_d[...,2] - rays_o[...,1]/rays_o[...,2])
+    d2 = -2. * near / rays_o[...,2]
+    
+    rays_o = torch.stack([o0,o1,o2], -1)
+    rays_d = torch.stack([d0,d1,d2], -1)
+    
     return rays_o, rays_d
 
 
@@ -948,15 +916,15 @@ def visualize_ray_bending(
 
 
 def determine_nerf_volume_extent(
-    render_function, poses, H, W, focal, ray_params, render_kwargs, args
+    render_function, poses, intrinsics, render_kwargs, args
 ):
     # the nerf volume has some extent, but this extent is not fixed. this function computes (somewhat approximate) minimum and maximum coordinates along each axis. it considers all cameras (their positions and point samples along the rays of their corners).
     poses = torch.Tensor(poses).cuda()
     critical_rays_o = []
     critical_rays_d = []
-    for c2w in poses:
+    for c2w, intrin in zip(poses, intrinsics): 
         this_c2w = c2w[:3, :4]
-        rays_o, rays_d = get_rays(H, W, focal, this_c2w, ray_params)
+        rays_o, rays_d = get_rays(this_c2w, intrin)
         camera_corners_o = torch.stack(
             [rays_o[0, 0, :], rays_o[-1, 0, :], rays_o[0, -1, :], rays_o[-1, -1, :]]
         )  # 4x3
@@ -974,16 +942,12 @@ def determine_nerf_volume_extent(
         "ray_invalidity": torch.zeros(num_rays),
         "rgb_validity": torch.ones(num_rays),
         "ray_bending_latents": torch.zeros(
-            (num_rays, ray_params["ray_bending_latent_size"])
+            (num_rays, intrinsics[0]["ray_bending_latent_size"])
         ),
     }
 
     with torch.no_grad():
         rgb, disp, acc, details_and_rest = render_function(
-            H,
-            W,
-            focal,
-            ray_params,
             critical_rays_o,
             critical_rays_d,
             chunk=128,

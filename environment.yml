@@ -11,4 +11,5 @@ dependencies:
  - imageio-ffmpeg
  - matplotlib
  - tqdm
+ - scikit-image
  - opencv=4.4.0

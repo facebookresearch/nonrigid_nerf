@@ -95,7 +95,7 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             bd_factor=bd_factor,
             spherify=spherify,
         )
-        extras = _get_multi_view_helper_mappings(images.shape[0])
+        extras = _get_multi_view_helper_mappings(images.shape[0], datatdir)
 
         # poses
         hwf = poses[0, :3, -1]
@@ -117,7 +117,7 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
                 + str(args.test_block_size)
                 + ") blocks"
             )
-            num_timesteps = len(dataset_extras["raw_timesteps"])
+            num_timesteps = len(extras["raw_timesteps"])
             test_timesteps = np.concatenate(
                 [
                     np.arange(
@@ -135,7 +135,7 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             i_test = [
                 imageid
                 for imageid, timestep in enumerate(
-                    dataset_extras["imageid_to_timestepid"]
+                    extras["imageid_to_timestepid"]
                 )
                 if timestep in test_timesteps
             ]
@@ -167,19 +167,19 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             render_kwargs_test_.update(bds_dict)
 
         if return_nerf_volume_extent:
-            ray_params = checkpoint_dict["ray_params"]
+            intrinsics = checkpoint_dict["intrinsics"]
             min_point, max_point = determine_nerf_volume_extent(
                 get_parallelized_render_function(),
                 poses,
-                hwf[0],
-                hwf[1],
-                hwf[2],
-                ray_params,
+                [ intrinsics[extras["imageid_to_viewid"][imageid]] for imageid in range(poses.shape[0]) ],
                 render_kwargs_test,
+                args
             )
             extras["min_nerf_volume_point"] = min_point.detach()
             extras["max_nerf_volume_point"] = max_point.detach()
-
+            
+        extras["intrinsics"] = checkpoint_dict["intrinsics"]
+        
         return (
             images,
             poses,
@@ -208,15 +208,18 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
         render_factor=None,
         with_ray_bending=None,
         custom_checkpoint_dict=None,
-        hwf=None,
+        intrinsics=None,
         chunk=None,
         custom_ray_params=None,
         custom_render_kwargs_test=None,
         rigidity_test_time_cutoff=None,
+        motion_factor=None,
+        foreground_removal=None
     ):
 
         # poses should have shape Nx3x4, rotations Nx3x3, translations Nx3 (or Nx3x1 or Nx1x3 or 3)
         # ray_bending_latents are a list of latent codes or an array of shape N x latent_size
+        # intrinsics should be a list of dicts with entries height, width, center_x, center_y, focal_x, focal_y
 
         # poses
         if poses is None:
@@ -242,18 +245,13 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             if custom_checkpoint_dict is None
             else custom_checkpoint_dict
         )
-        ray_params_ = (
-            checkpoint_dict_["ray_params"]
-            if custom_ray_params is None
-            else custom_ray_params
-        )
         render_kwargs_test_ = (
             render_kwargs_test
             if custom_render_kwargs_test is None
             else custom_render_kwargs_test
         )
-        if hwf is None:
-            hwf = checkpoint_dict_["scripts_dict"]["hwf"]
+        if intrinsics is None:
+            intrinsics = [ checkpoint_dict["intrinsics"][0] for _ in range(len(poses)) ]
         if chunk is None:
             chunk = args.chunk
         if render_factor is None:
@@ -264,12 +262,25 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             with_ray_bending = True
 
         if with_ray_bending:
+            # forced background stabilization
             backup_rigidity_test_time_cutoff = render_kwargs_test_[
                 "ray_bender"
             ].rigidity_test_time_cutoff
             render_kwargs_test_[
                 "ray_bender"
             ].rigidity_test_time_cutoff = rigidity_test_time_cutoff
+            # motion exaggeration/dampening
+            backup_test_time_scaling = render_kwargs_test_[
+                "ray_bender"
+            ].test_time_scaling
+            render_kwargs_test_[
+                "ray_bender"
+            ].test_time_scaling = motion_factor
+            # foreground removal
+            backup_foreground_removal = render_kwargs_test_["network_fn"].test_time_nonrigid_object_removal_threshold
+            render_kwargs_test_["network_fn"].test_time_nonrigid_object_removal_threshold = foreground_removal
+            if "network_fine" in render_kwargs_test_:
+                render_kwargs_test_["network_fine"].test_time_nonrigid_object_removal_threshold = foreground_removal
         else:
             backup_ray_bender = render_kwargs_test_["network_fn"].ray_bender
             render_kwargs_test_["network_fn"].ray_bender = (None,)
@@ -286,9 +297,8 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
         with torch.no_grad():
             returned_outputs = render_path(
                 poses,
-                hwf,
+                intrinsics,
                 args.chunk,
-                ray_params_,
                 render_kwargs_test_,
                 render_factor=render_factor,
                 detailed_output=detailed_output,
@@ -300,6 +310,12 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             render_kwargs_test_[
                 "ray_bender"
             ].rigidity_test_time_cutoff = backup_rigidity_test_time_cutoff
+            render_kwargs_test_[
+                "ray_bender"
+            ].test_time_scaling = backup_test_time_scaling
+            render_kwargs_test_["network_fn"].test_time_nonrigid_object_removal_threshold = backup_foreground_removal
+            if "network_fine" in render_kwargs_test_:
+                render_kwargs_test_["network_fine"].test_time_nonrigid_object_removal_threshold = backup_foreground_removal
         else:
             render_kwargs_test_["network_fn"].ray_bender = backup_ray_bender
             render_kwargs_test_["ray_bender"] = backup_ray_bender[0]
@@ -401,6 +417,10 @@ def create_folder(folder):
 
 def free_viewpoint_rendering(args):
 
+    # memory vs. speed and quality
+    frames_at_a_time = 10 # set to 1 to reduce memory requirements
+    only_rgb = False # set to True to reduce memory requirements. Needs to be False for some scene editing to work.
+
     # determine output name
     if args.camera_path == "spiral":
         output_name = args.deformations + "_" + args.camera_path
@@ -408,10 +428,19 @@ def free_viewpoint_rendering(args):
         output_name = (
             args.deformations + "_" + args.camera_path + "_" + str(args.fixed_view)
         )
-    elif args.camera_path == "input_recontruction":
+    elif args.camera_path == "input_reconstruction":
         output_name = args.deformations + "_" + args.camera_path
     else:
         raise RuntimeError("invalid --camera_path argument")
+        
+    if args.forced_background_stabilization is not None:
+        output_name += "_fbs_" + str(args.forced_background_stabilization)
+    if args.motion_factor is not None:
+        output_name += "_exaggeration_" + str(args.motion_factor)
+    if args.foreground_removal is not None:
+        output_name += "_removal_" + str(args.foreground_removal)
+    if args.render_canonical:
+        output_name += "_canonical"
 
     output_folder = os.path.join(args.input, "output", output_name)
     create_folder(output_folder)
@@ -490,22 +519,48 @@ def free_viewpoint_rendering(args):
 
     # determine camera poses and latent codes
     num_poses = poses.shape[0]
-    if args.camera_path == "input_recontruction":
+    intrinsics = dataset_extras["intrinsics"]
+    if args.camera_path == "input_reconstruction":
         poses = poses
+        intrinsics = [ intrinsics[dataset_extras["imageid_to_viewid"][i]] for i in range(num_poses) ]
     elif args.camera_path == "fixed":
         poses = torch.stack(
             [torch.Tensor(poses[args.fixed_view]) for _ in range(num_poses)], 0
         )  # N x 3 x 4
+        intrinsics = [ intrinsics[dataset_extras["imageid_to_viewid"][args.fixed_view]] for _ in range(num_poses) ]
     elif args.camera_path == "spiral":
         # poses = np.stack(_spiral_poses(poses, bds, num_poses), axis=0)
         poses = []
         while len(poses) < num_poses:
             poses += [render_pose for render_pose in render_poses]
         poses = np.stack(poses, axis=0)[:num_poses]
+        intrinsics = [ intrinsics[dataset_extras["imageid_to_viewid"][0]] for _ in range(num_poses) ]
     else:
         # poses has shape N x ... and ray_bending_latents has shape N x ...
         # Can design custom camera paths here.
+        # poses is indexed with imageid
+        # ray_bending_latents is indexed with timestepid
+        # intrinsics is indexed with viewid
+        # images is indexed with imageid
         raise RuntimeError
+        
+        # example with time interpolation from a fixed camera view
+        num_target_frames = 500
+        latent_indices = np.linspace(0, ray_bending_latents.shape[0]-1, num=num_target_frames)
+        start_indices = np.floor(latent_indices).astype(np.int)
+        end_indices = np.ceil(latent_indices).astype(np.int)
+        start_latents = ray_bending_latents[start_indices] # num_target_frames x latent_size
+        end_latents = ray_bending_latents[end_indices] # num_target_frames x latent_size
+        interpolation_factors = latent_indices - start_indices # shape: num_target_frames. should be in [0,1]
+        interpolation_factors = torch.Tensor(interpolation_factors).reshape(-1,1) # num_target_frames x 1
+        ray_bending_latents = end_latents * interpolation_factors + start_latents * (1.-interpolation_factors)
+        
+        fixed_camera = 0
+        poses = torch.stack(
+            [torch.Tensor(poses[fixed_camera]) for _ in range(num_target_frames)], 0
+        )  # N x 3 x 4
+        intrinsics = [ intrinsics[dataset_extras["imageid_to_viewid"][fixed_camera]] for _ in range(num_target_frames) ]
+        
     latents = ray_bending_latents
 
     latents = latents.detach().cuda()
@@ -516,7 +571,6 @@ def free_viewpoint_rendering(args):
     rgbs = []
     disps = []
 
-    frames_at_a_time = 10
     num_output_frames = poses.shape[0]
     for start_index in range(0, num_output_frames, frames_at_a_time):
 
@@ -535,17 +589,28 @@ def free_viewpoint_rendering(args):
         sublatents = [latents[i] for i in range(start_index, end_index)]
 
         # render
-        subrgbs, subdisps, details_and_rest = render_convenient(
+        returned = render_convenient(
             poses=subposes,
             ray_bending_latents=sublatents,
+            intrinsics=intrinsics,
             with_ray_bending=not args.render_canonical,
-            detailed_output=True,
+            detailed_output=not only_rgb,
             rigidity_test_time_cutoff=args.forced_background_stabilization,
+            motion_factor=args.motion_factor,
+            foreground_removal=args.foreground_removal
         )
+        if only_rgb:
+            subrgbs, subdisps = returned
+        else:
+            subrgbs, subdisps, details_and_rest = returned
         print("finished rendering", flush=True)
 
         rgbs += [image for image in subrgbs]
         disps += [image for image in subdisps]
+        if only_rgb:
+            correspondence_rgbs += [ None for _ in subrgbs]
+            rigidities += [ None for _ in subrgbs]
+            continue
 
         # determine correspondences
         # details_and_rest: list, one entry per image. each image has first two dimensions height x width.
@@ -607,17 +672,19 @@ def free_viewpoint_rendering(args):
         disp_saveable = convert_disparity_to_saveable(disp)
         disp_jet = convert_disparity_to_jet(disp)
         disp_phong = convert_disparity_to_phong(disp)
-        correspondence_rgb = convert_rgb_to_saveable(correspondence_rgb)
+        if not only_rgb:
+            correspondence_rgb = convert_rgb_to_saveable(correspondence_rgb)
         if use_rigidity:
             rigidity_saveable = convert_disparity_to_saveable(rigidity, normalize=False)
             rigidity_jet = convert_disparity_to_jet(rigidity, normalize=False)
 
         file_postfix = "_" + str(i).zfill(6) + ".png"
         imageio.imwrite(os.path.join(output_folder, "rgb" + file_postfix), rgb)
-        imageio.imwrite(
-            os.path.join(output_folder, "correspondences" + file_postfix),
-            correspondence_rgb,
-        )
+        if not only_rgb:
+            imageio.imwrite(
+                os.path.join(output_folder, "correspondences" + file_postfix),
+                correspondence_rgb,
+            )
         if use_rigidity:
             imageio.imwrite(
                 os.path.join(output_folder, "rigidity" + file_postfix),
@@ -646,13 +713,14 @@ def free_viewpoint_rendering(args):
             fps=args.output_video_fps,
             quality=9,
         )
-        print("storing correspondence RGB video...", flush=True)
-        imageio.mimwrite(
-            file_prefix + "correspondences.mp4",
-            convert_rgb_to_saveable(correspondence_rgbs),
-            fps=args.output_video_fps,
-            quality=9,
-        )
+        if not only_rgb:
+            print("storing correspondence RGB video...", flush=True)
+            imageio.mimwrite(
+                file_prefix + "correspondences.mp4",
+                convert_rgb_to_saveable(correspondence_rgbs),
+                fps=args.output_video_fps,
+                quality=9,
+            )
         print("storing disparity video...", flush=True)
         imageio.mimwrite(
             file_prefix + "disp.mp4",
@@ -698,32 +766,115 @@ def free_viewpoint_rendering(args):
             )
     except:
         print("imageio.mimwrite() failed. maybe ffmpeg is not installed properly?")
+        
+    # evaluation of background stability
+    if args.camera_path == "fixed":
+        standard_deviations = np.std(rgbs, axis=0)
+        averaged_standard_devations = 10 * np.mean(standard_deviations, axis=-1)
+        
+        from matplotlib import cm
+        color_mapping = np.array([ cm.jet(i)[:3] for i in range(256) ])
+        max_value = 1
+        min_value = 0
+        averaged_standard_devations = np.clip(averaged_standard_devations, a_max=max_value, a_min=min_value) / max_value # cut off above max_value. result is normalized to [0,1]
+        averaged_standard_devations = (255. * averaged_standard_devations).astype('uint8') # now contains int in [0,255]
+        original_shape = averaged_standard_devations.shape
+        averaged_standard_devations = color_mapping[averaged_standard_devations.flatten()]
+        averaged_standard_devations = averaged_standard_devations.reshape(original_shape + (3,))
+        
+        imageio.imwrite(os.path.join(output_folder, "standard_deviations.png"), averaged_standard_devations)
 
-    # error maps
-    if args.camera_path == "input_recontruction":
-        errors = []
-        for i, (gt_image, rgb) in enumerate(zip(images, rgbs)):
-            error = np.linalg.norm(gt_image - rgb, axis=-1) / np.sqrt(
-                1 + 1 + 1
-            )  # height x width
-            error *= 10.0  # exaggarate error
-            error = np.clip(error, 0.0, 1.0)
-            error = convert_disparity_to_jet(
-                error, normalize=False
-            )  # height x width x 3. int values in [0,255]
-            errors.append(error)
-            imageio.imwrite(
-                os.path.join(output_folder, "error_" + str(i).zfill(6) + ".png"), error
-            )
+    # quantitative evaluation
+    if args.camera_path == "input_reconstruction":
         try:
-            imageio.mimwrite(
-                file_prefix + "error.mp4",
-                np.stack(errors, axis=0),
-                fps=args.output_video_fps,
-                quality=9,
-            )
+            from PerceptualSimilarity import lpips
+            perceptual_metric = lpips.LPIPS(net='alex')
         except:
-            print("imageio.mimwrite() failed. maybe ffmpeg is not installed properly?")
+            print("Perceptual LPIPS metric not found. Please see the README for installation instructions")
+            perceptual_metric = None
+            
+        create_error_maps = True # whether to write out error images instead of just computing scores
+    
+        naive_error_folder = os.path.join(output_folder, "naive_errors/")
+        create_folder(naive_error_folder)
+        ssim_error_folder = os.path.join(output_folder, "ssim_errors/")
+        create_folder(ssim_error_folder)
+        
+        to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
+        def visualize_with_jet_color_scheme(image):
+            from matplotlib import cm
+            color_mapping = np.array([ cm.jet(i)[:3] for i in range(256) ])
+            max_value = 1.0
+            min_value = 0.0
+            intermediate = np.clip(image, a_max=max_value, a_min=min_value) / max_value # cut off above max_value. result is normalized to [0,1]
+            intermediate = (255. * intermediate).astype('uint8') # now contains int in [0,255]
+            original_shape = intermediate.shape
+            intermediate = color_mapping[intermediate.flatten()]
+            intermediate = intermediate.reshape(original_shape + (3,))
+            return intermediate
+
+        mask = None
+        scores = {}
+        from skimage.metrics import structural_similarity as ssim
+        for i, (groundtruth, generated) in enumerate(zip(images, rgbs)):   
+
+            if mask is None: # undistortion leads to masked-out black pixels in groundtruth
+                mask = (np.sum(groundtruth, axis=-1) == 0.)
+            groundtruth[mask] = 0.
+            generated[mask] = 0.
+            
+            # PSNR
+            mse = np.mean((groundtruth - generated) ** 2)
+            psnr = -10. * np.log10(mse)
+            
+            # SSIM
+            # https://scikit-image.org/docs/dev/api/skimage.metrics.html#skimage.metrics.structural_similarity
+            returned = ssim(groundtruth, generated, data_range=1.0, multichannel=True, gaussian_weights=True, sigma=1.5, use_sample_covariance=False, full=create_error_maps)
+            if create_error_maps:
+                ssim_error, ssim_error_image = returned
+            else:
+                ssim_error = returned
+                
+            # perceptual metric 
+            if perceptual_metric is None:
+                lpips = 1.
+            else:
+                def numpy_to_pytorch(np_image):
+                    torch_image = 2 * torch.from_numpy(np_image) - 1 # height x width x 3. must be in [-1,+1]
+                    torch_image = torch_image.permute(2, 0, 1) # 3 x height x width
+                    return torch_image.unsqueeze(0) # 1 x 3 x height x width
+                lpips = perceptual_metric.forward(numpy_to_pytorch(groundtruth), numpy_to_pytorch(generated))
+                lpips = float(lpips.detach().reshape(1).numpy()[0])
+            
+            scores[i] = {"psnr": psnr, "ssim": ssim_error, "lpips": lpips}
+            
+            if create_error_maps:
+                # MSE-style
+                error = np.linalg.norm(groundtruth - generated, axis=-1) / np.sqrt(1+1+1) # height x width
+                error *= 10. # exaggarate error
+                error = np.clip(error, 0.0, 1.0)
+                error = to8b(visualize_with_jet_color_scheme(error)) # height x width x 3. int values in [0,255]
+                filename = os.path.join(naive_error_folder, 'error_{:03d}.png'.format(i))
+                imageio.imwrite(filename, error)
+                
+                # SSIM
+                filename = os.path.join(ssim_error_folder, 'error_{:03d}.png'.format(i))
+                ssim_error_image = to8b(visualize_with_jet_color_scheme(1.-np.mean(ssim_error_image, axis=-1)))
+                imageio.imwrite(filename, ssim_error_image)
+        
+        averaged_scores = {}
+        averaged_scores["average_psnr"] = np.mean([ score["psnr"] for score in scores.values() ])
+        averaged_scores["average_ssim"] = np.mean([ score["ssim"] for score in scores.values() ])
+        averaged_scores["average_lpips"] = np.mean([ score["lpips"] for score in scores.values() ])
+        
+        print(averaged_scores, flush=True)
+        
+        scores.update(averaged_scores)
+        
+        import json
+        with open(os.path.join(output_folder, "scores.json"), "w") as json_file:
+            json.dump(scores, json_file, indent=4)
+
 
 
 if __name__ == "__main__":
@@ -745,7 +896,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--camera_path",
         type=str,
-        help='"input_recontruction", "fixed". camera path to use for re-rendering. optionally, implement "spiral", see README.md',
+        help='"input_reconstruction", "fixed". camera path to use for re-rendering. optionally, implement "spiral", see README.md',
     )
     # optional camera path arguments
     parser.add_argument(
@@ -760,6 +911,18 @@ if __name__ == "__main__":
         type=float,
         default=None,
         help="prevents deformations of points that are more rigid than the provided threshold. needs to be manually determined. can be None or a float in [0,1]. default is None.",
+    )
+    parser.add_argument(
+        "--motion_factor",
+        type=float,
+        default=None,
+        help="multiplies offsets by the provided float. Values over 1 exaggerate, values below 1 dampen the motion. default is None.",
+    )
+    parser.add_argument(
+        "--foreground_removal",
+        type=float,
+        default=None,
+        help="removes points that are less rigid than the provided threshold. needs to be manually determined. can be None or a float in [0,1]. default is None.",
     )
     parser.add_argument(
         "--render_canonical",
