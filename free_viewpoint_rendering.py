@@ -95,7 +95,7 @@ def _setup_nonrigid_nerf_network(results_folder, checkpoint="latest"):
             bd_factor=bd_factor,
             spherify=spherify,
         )
-        extras = _get_multi_view_helper_mappings(images.shape[0], datatdir)
+        extras = _get_multi_view_helper_mappings(images.shape[0], datadir)
 
         # poses
         hwf = poses[0, :3, -1]
